@@ -12,6 +12,7 @@ import os
 import json
 from docopt import docopt
 import pkg_resources
+import csv
 
 cmd_str = """Usage:
 rd_filters filter --in INPUT_FILE --prefix PREFIX [--rules RULES_FILE_NAME] [--alerts ALERT_FILE_NAME][--np NUM_CORES]
@@ -107,51 +108,86 @@ def get_config_file(file_name, environment_variable):
 
 
 class RDFilters:
-    def __init__(self, rules_file_name):
-        good_name = get_config_file(rules_file_name, "FILTER_RULES_DIR")
-        self.rule_df = pd.read_csv(good_name)
-        # make sure there wasn't a blank line introduced
-        self.rule_df = self.rule_df.dropna()
-        self.rule_list = []
-
-    def build_rule_list(self, alert_name_list):
+    def __init__(self, params, verbose=False):
+        """Initialize RDFilters object and setup filtering rules
+        :param params: dict of filter parameters
+        :param verbose: boolean for reporting
         """
-        Read the alerts csv file and select the rule sets defined in alert_name_list
-        :param alert_name_list: list of alert sets to use
-        :return:
-        """
-        self.rule_df = self.rule_df[self.rule_df.rule_set_name.isin(alert_name_list)]
-        tmp_rule_list = self.rule_df[["rule_id", "smarts", "max", "description"]].values.tolist()
-        for rule_id, smarts, max_val, desc in tmp_rule_list:
-            smarts_mol = Chem.MolFromSmarts(smarts)
-            if smarts_mol:
-                self.rule_list.append([smarts_mol, max_val, desc])
-            else:
-                print(f"Error parsing SMARTS for rule {rule_id}", file=sys.stderr)
-
-    def get_alert_sets(self):
-        """
-        :return: a list of unique rule set names
-        """
-        return self.rule_df.rule_set_name.unique()
+        self.params = params
+        self.verbose = verbose
+        self.rule_list = []  # [(pattern, max_count, description), ...]
+        self.rule_dict = {}  # {rule_name: (min, max), ...}
+        self.alert_names = []  # Store alert names
+        self.alert_priorities = {}  # Store priorities for each alert
+        self.alert_smarts = {}  # Store SMARTS patterns for each alert
+        
+        # Read in alert data
+        alert_filename = params.get("alert_filename", "")
+        if alert_filename:
+            with open(alert_filename, "r") as f:
+                reader = csv.reader(f)
+                next(reader)  # Skip header
+                for row in reader:
+                    rule_id, rule_set, desc, smarts, rule_set_name, priority, max_val = row
+                    pattern = Chem.MolFromSmarts(smarts)
+                    if pattern is None:
+                        if verbose:
+                            print(f"Invalid SMARTS pattern: {smarts}", file=sys.stderr)
+                        continue
+                    self.rule_list.append((pattern, int(max_val), desc))
+                    self.alert_names.append(desc)
+                    self.alert_priorities[desc] = int(priority)
+                    self.alert_smarts[desc] = smarts
 
     def evaluate(self, lst_in):
         """
         Evaluate structure alerts on a list of SMILES
         :param lst_in: input list of [SMILES, Name]
-        :return: list of alerts matched or "OK"
+        :return: list of alerts matched with properties and alert columns with matching substructures
         """
         smiles, name = lst_in
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
-            return [smiles, name, 'INVALID', -999, -999, -999, -999, -999, -999]
+            # Create a list of empty strings for each alert
+            alert_results = [""] * len(self.alert_names)
+            alert_smarts_results = [""] * len(self.alert_names)
+            return [smiles, name, 'INVALID', -999, -999, -999, -999, -999, -999] + alert_results + alert_smarts_results
+        
         desc_list = [MolWt(mol), MolLogP(mol), NumHDonors(mol), NumHAcceptors(mol), TPSA(mol),
                      CalcNumRotatableBonds(mol)]
-        for row in self.rule_list:
-            patt, max_val, desc = row
-            if len(mol.GetSubstructMatches(patt)) > max_val:
-                return [smiles, name] + [desc + " > %d" % (max_val)] + desc_list
-        return [smiles, name] + ["OK"] + desc_list
+        
+        # Initialize alert results
+        alert_results = [""] * len(self.alert_names)  # For substructure matches
+        alert_smarts_results = [""] * len(self.alert_names)  # For SMARTS patterns
+        alerts = []
+        
+        # Check each alert
+        for i, (patt, max_val, desc) in enumerate(self.rule_list):
+            matches = mol.GetSubstructMatches(patt)
+            if len(matches) > max_val:
+                alerts.append(desc)
+                # Get the matching substructure SMILES
+                match_atoms = set()
+                for match in matches:
+                    match_atoms.update(match)
+                
+                # Create a molecule from the matching atoms
+                match_mol = Chem.RWMol(mol)
+                atoms_to_delete = []
+                for atom_idx in range(match_mol.GetNumAtoms()):
+                    if atom_idx not in match_atoms:
+                        atoms_to_delete.append(atom_idx)
+                
+                # Delete atoms in reverse order to maintain correct indices
+                for atom_idx in sorted(atoms_to_delete, reverse=True):
+                    match_mol.RemoveAtom(atom_idx)
+                
+                # Store both the matching substructure and the SMARTS pattern
+                alert_results[i] = Chem.MolToSmiles(match_mol)
+                alert_smarts_results[i] = self.alert_smarts[desc]
+        
+        alert_str = "; ".join(alerts) if alerts else "OK"
+        return [smiles, name, alert_str] + desc_list + alert_results + alert_smarts_results
 
 
 def main():
@@ -184,27 +220,46 @@ def main():
         print(f"Using alerts from {rule_str}", file=sys.stderr)
         rf.build_rule_list(rule_list)
         res = list(p.map(rf.evaluate, input_data))
-        df = pd.DataFrame(res, columns=["SMILES", "NAME", "FILTER", "MW", "LogP", "HBD", "HBA", "TPSA", "Rot"])
-        df_ok = df[
-            (df.FILTER == "OK") &
-            df.MW.between(*rule_dict["MW"]) &
-            df.LogP.between(*rule_dict["LogP"]) &
-            df.HBD.between(*rule_dict["HBD"]) &
-            df.HBA.between(*rule_dict["HBA"]) &
-            df.TPSA.between(*rule_dict["TPSA"]) &
-            df.Rot.between(*rule_dict["Rot"])
-            ]
+        
+        # Create column names including alert names
+        base_columns = ["SMILES", "NAME", "FILTER", "MW", "LogP", "HBD", "HBA", "TPSA", "Rot"]
+        alert_columns = []
+        for name in rf.alert_names:
+            alert_columns.extend([
+                f"{name} (p{rf.alert_priorities[name]}) - substructure",
+                f"{name} (p{rf.alert_priorities[name]}) - SMARTS"
+            ])
+        all_columns = base_columns + alert_columns
+        
+        df = pd.DataFrame(res, columns=all_columns)
+        
+        # Create property filter column
+        df['PROP_FILTER'] = 'PASS'
+        mask = (
+            ~df.MW.between(*rule_dict["MW"]) |
+            ~df.LogP.between(*rule_dict["LogP"]) |
+            ~df.HBD.between(*rule_dict["HBD"]) |
+            ~df.HBA.between(*rule_dict["HBA"]) |
+            ~df.TPSA.between(*rule_dict["TPSA"]) |
+            ~df.Rot.between(*rule_dict["Rot"])
+        )
+        df.loc[mask, 'PROP_FILTER'] = 'FAIL'
+
+        # Write output files
         output_smiles_file = prefix_name + ".smi"
         output_csv_file = prefix_name + ".csv"
-        df_ok[["SMILES", "NAME"]].to_csv(f"{output_smiles_file}", sep=" ", index=False, header=False)
-        print(f"Wrote SMILES for molecules passing filters to {output_smiles_file}", file=sys.stderr)
-        df.to_csv(f"{prefix_name}.csv", index=False)
+        df[["SMILES", "NAME"]].to_csv(f"{output_smiles_file}", sep=" ", index=False, header=False)
+        df.to_csv(f"{output_csv_file}", index=False)
+        
+        print(f"Wrote all SMILES to {output_smiles_file}", file=sys.stderr)
         print(f"Wrote detailed data to {output_csv_file}", file=sys.stderr)
 
-        num_input_rows = df.shape[0]
-        num_output_rows = df_ok.shape[0]
-        fraction_passed = "%.1f" % (num_output_rows / num_input_rows * 100.0)
-        print(f"{num_output_rows} of {num_input_rows} passed filters {fraction_passed}%", file=sys.stderr)
+        # Count statistics
+        num_total = df.shape[0]
+        num_passed = ((df.FILTER == "OK") & (df.PROP_FILTER == "PASS")).sum()
+        fraction_passed = "%.1f" % (num_passed / num_total * 100.0)
+        print(f"{num_passed} of {num_total} passed all filters {fraction_passed}%", file=sys.stderr)
+        
         elapsed_time = "%.2f" % (time.time() - start_time)
         print(f"Elapsed time {elapsed_time} seconds", file=sys.stderr)
 
